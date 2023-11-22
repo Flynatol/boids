@@ -1,27 +1,29 @@
 use std::{
     f32::consts::PI,
     ops::{Div, Sub},
-    vec, time::Duration,
+    time::Duration, sync::Arc, rc::Rc,
 };
+
+use rayon::prelude::*;
 
 use bevy::{
     input::mouse::MouseWheel, prelude::*, render::render_resource::PrimitiveTopology,
     sprite::MaterialMesh2dBundle, time::common_conditions::on_timer,
 };
-use bevy_egui::{egui, EguiContexts};
+
 use bevy_prototype_debug_lines::*;
 use rand::prelude::*;
 
 use bevy_inspector_egui::quick::ResourceInspectorPlugin;
-use bevy_inspector_egui::quick::WorldInspectorPlugin;
 
-const tick_rate: f64 = 1./6000.;
+const TICK_RATE: f64 = 1./60.;
+const SCALE_FACTOR: f32 = 0.4;
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(DebugLinesPlugin::default())
-        //.add_plugin(EguiPlugin)
+
         .init_resource::<UiState>()
         .register_type::<UiState>()
         .add_plugins(ResourceInspectorPlugin::<UiState>::default())
@@ -30,18 +32,26 @@ fn main() {
         .register_type::<TPS>()
         .add_plugins(ResourceInspectorPlugin::<TPS>::default())
 
-        .add_plugins(WorldInspectorPlugin::new())
+        .init_resource::<boid_resources>()
+
+        .init_resource::<GridRes>()
+        
+        //.add_plugins(WorldInspectorPlugin::new())
+
         .add_systems(Startup, setup)
-        //.add_systems(Update, (go_forward.run_if(on_timer(Duration::from_secs_f64(1.0 / 60.))), update_sight.run_if(on_timer(Duration::from_secs_f64(1.0 / 60.))), go_align.run_if(on_timer(Duration::from_secs_f64(1.0 / 60.)))).chain())
-        .add_systems(Update, (go_forward, update_sight, go_align).run_if(on_timer(Duration::from_secs_f64(tick_rate))).chain())
-        .add_systems(Update, (go_wobble.run_if(on_timer(Duration::from_secs_f64(tick_rate))), scroll_events, update_tps))
-        //.add_system(ui_example_system)
+        
+        .add_systems(Update, (gp_draw_check))
+        .add_systems(Update, ((population_manager, update_grid).chain()).run_if(on_timer(Duration::from_secs_f64(1./5.))))
+        .add_systems(Update, (go_forward, go_align, (update_sight).chain()).run_if(on_timer(Duration::from_secs_f64(TICK_RATE))).chain())
+        .add_systems(Update, (go_wobble.run_if(on_timer(Duration::from_secs_f64(TICK_RATE))), scroll_events, update_tps))
+         
         .run();
 }
 
+const TRIANGLE_SIZE: f32 = 5. * SCALE_FACTOR;
+
 #[derive(Reflect, Resource)]
 struct UiState {
-    triangle_size: f32,
     num_boids: i32,
     align_factor: f32,
     coherence_factor: f32,
@@ -69,12 +79,10 @@ impl Default for TPS {
     }
 }
 
-
 impl Default for UiState {
     fn default() -> Self {
         UiState {
-            triangle_size: 5.,
-            num_boids: 3000,
+            num_boids: 10000,
             align_factor: 15.,
             coherence_factor: 0.1,
             bound_range: 50.,
@@ -88,19 +96,6 @@ impl Default for UiState {
             show_gp: false,
         }
     }
-    /*
-           triangle_size: 5.,
-           num_boids: 5000,
-           align_factor: 10.,
-           coherence_factor: 0.1,
-           bound_range: 70.,
-           repel_distance: 1000.,
-           avoidance_factor: 1.5,
-           wall_range: 150.,
-           turn_rate: 0.01,
-           wall_factor: 2.,
-           boid_speed: 0.5,
-    */
 }
 
 fn update_tps(
@@ -108,12 +103,10 @@ fn update_tps(
     mut tps: ResMut<TPS>,
 ) {
     tps.tps = (1./time.delta_seconds_f64()) as f32;
-
     if tps.tps.is_infinite() {return}
-
     tps.average_tps = tps.average_tps * (tps.count - 1.)/tps.count + tps.tps/tps.count;
-
     tps.count += 1.;
+
 }
 
 fn scroll_events(
@@ -121,68 +114,107 @@ fn scroll_events(
     mut camera_transform: Query<&mut OrthographicProjection, With<Camera>>,
 ) {
     use bevy::input::mouse::MouseScrollUnit;
-    for ev in scroll_evr.iter() {
-        match ev.unit {
+    for mw in scroll_evr.iter() {
+        match mw.unit {
             MouseScrollUnit::Line => {
-                println!(
-                    "Scroll (line units): vertical: {}, horizontal: {}",
-                    ev.y, ev.x
-                );
                 let mut projection = camera_transform.single_mut();
-                projection.scale *= 1.025 + ev.y * 0.225;
+                projection.scale *= 1.025 + mw.y * 0.225;
                 projection.scale = projection.scale.max(0.25);
             }
-            MouseScrollUnit::Pixel => {
-                println!(
-                    "Scroll (pixel units): vertical: {}, horizontal: {}",
-                    ev.y, ev.x
-                );
-            }
+            MouseScrollUnit::Pixel => {}
         }
     }
 }
 
 fn setup(
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
     windows: Query<&Window>,
     ui_state: Res<UiState>,
+    boid_res: Res<boid_resources>
 ) {
-    commands.spawn(Camera2dBundle::default());
+    commands.spawn(Camera2dBundle {
+        transform: Transform::from_xyz(0.0, 0.0, 5.0),
+        ..Default::default()
+    });
 
     let res = &windows.single().resolution;
 
     for _ in 0..ui_state.num_boids {
-        let mut test = Mesh::new(PrimitiveTopology::TriangleList);
+        spawn_random_boid(&mut commands, &boid_res, res)
+    }
+}
+
+fn spawn_random_boid(commands: &mut Commands, boid_res: &boid_resources, res: &bevy::window::WindowResolution) {
+    let rand_transform = Transform::from_translation(Vec3::new(
+        (random::<f32>() - 0.5) * res.width(),
+        (random::<f32>() - 0.5) * res.height(),
+        0.,
+    ))
+    .with_rotation(Quat::from_rotation_z(random::<f32>() * 2. * PI));
+
+    commands.spawn((
+        MaterialMesh2dBundle {
+            mesh: boid_res.mesh.clone().into(),
+            material: boid_res.material.clone(),
+            transform: rand_transform,
+            ..default()
+        },
+        Boid,
+        Forward,
+        Wobble,
+        Align,
+        Sight(Arc::from([])),
+    ));
+}
+
+fn population_manager(
+    mut commands: Commands, 
+    boids: Query<Entity, With<Boid>>, 
+    ui_state: Res<UiState>,
+    windows: Query<&Window>,
+    boid_res: Res<boid_resources>
+) {
+    let current_pop = boids.iter().count();
+    let desired_pop = ui_state.num_boids as usize;
+
+    if current_pop == desired_pop {return};
+
+    if current_pop > desired_pop {
+        //Cull boids
+        boids.iter().take(current_pop - desired_pop).for_each(|e| commands.entity(e).despawn());
+
+    } else if current_pop < desired_pop {
+        for i in 0 .. desired_pop - current_pop {
+            spawn_random_boid(&mut commands, &boid_res, &windows.single().resolution)
+        }
+    }
+}
+
+#[derive(Resource)]
+struct boid_resources {
+    mesh: Handle<Mesh>,
+    material: Handle<ColorMaterial>,
+}
+
+impl FromWorld for boid_resources {
+    fn from_world(world: &mut World) -> Self {
+        let mut meshes = world.resource_mut::<Assets<Mesh>>();
+        let mut boid_mesh = Mesh::new(PrimitiveTopology::TriangleList);
+        
         let v_pos = vec![
-            [-ui_state.triangle_size, -ui_state.triangle_size / 2., 0.0],
-            [ui_state.triangle_size, 0., 0.0],
-            [-ui_state.triangle_size, ui_state.triangle_size / 2., 0.0],
+            [-TRIANGLE_SIZE , -TRIANGLE_SIZE / 2., 0.0],
+            [TRIANGLE_SIZE, 0., 0.0],
+            [-TRIANGLE_SIZE, TRIANGLE_SIZE / 2., 0.0],
         ];
 
-        test.insert_attribute(Mesh::ATTRIBUTE_POSITION, v_pos);
+        boid_mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, v_pos);
 
-        let rand_transform = Transform::from_translation(Vec3::new(
-            (random::<f32>() - 0.5) * res.width(),
-            (random::<f32>() - 0.5) * res.height(),
-            0.,
-        ))
-        .with_rotation(Quat::from_rotation_z(random::<f32>() * 2. * PI));
+        let mesh_handle = meshes.add(boid_mesh);
 
-        commands.spawn((
-            MaterialMesh2dBundle {
-                mesh: meshes.add(test).into(),
-                material: materials.add(ColorMaterial::from(Color::PURPLE)),
-                transform: rand_transform,
-                ..default()
-            },
-            Boid,
-            Forward,
-            Wobble,
-            Align,
-            Sight(vec![]),
-        ));
+        let mut materials = world.resource_mut::<Assets<ColorMaterial>>();
+        let material_handle = materials.add(ColorMaterial::from(Color::PURPLE));
+
+        Self { mesh: mesh_handle, material: material_handle }
     }
 }
 
@@ -190,7 +222,7 @@ fn go_forward(mut query: Query<&mut Transform, With<Forward>>, ui_state: Res<UiS
     for mut transform in query.iter_mut() {
         transform.translation = transform.translation
             + transform.rotation.mul_vec3(Vec3 {
-                x: ui_state.boid_speed,
+                x: ui_state.boid_speed * SCALE_FACTOR,
                 y: 0.,
                 z: 0.,
             });
@@ -205,7 +237,6 @@ fn go_wobble(mut query: Query<&mut Transform, With<Wobble>>) {
 
 fn go_align(
     mut query: Query<(&mut Transform, &Sight, Entity), With<Align>>,
-    mut lines: ResMut<DebugLines>,
     windows: Query<&Window>,
     ui_state: Res<UiState>,
 ) {
@@ -227,8 +258,6 @@ fn go_align(
             .sum::<Vec3>()
             .normalize_or_zero();
 
-        //lines.line_gradient(boid.translation, boid.translation + (alignment_target * 50.), 0., Color::BLUE, Color::WHITE);
-
         //Coherence
         let coherence_target = sight
             .0
@@ -238,22 +267,20 @@ fn go_align(
             .div(sight.0.len().max(1) as f32)
             .sub(boid.translation);
 
-        //lines.line_gradient(boid.translation, boid.translation + (coherence_target), 0., Color::GREEN, Color::WHITE);
-
         //Avoidance
         let avoidance_target_working = sight
             .0
             .iter()
             .filter_map(|transform| {
                 let d = transform.translation.distance_squared(boid.translation);
-                if d < ui_state.repel_distance && d > 0.1 {
+                if d < ui_state.repel_distance*SCALE_FACTOR*SCALE_FACTOR && d > 0.1 {
                     Some((transform, d))
                 } else {
                     None
                 }
             })
             .map(|(tranform, distance)| {
-                (boid.translation - tranform.translation) * (ui_state.repel_distance / distance)
+                (boid.translation - tranform.translation) * (ui_state.repel_distance*SCALE_FACTOR*SCALE_FACTOR / distance)
             })
             .fold((0., Vec3::ZERO), |(a, b), x| (a + 1., b + x));
 
@@ -266,14 +293,6 @@ fn go_align(
 
         //Wall Avoidance
         let res = &windows.single().resolution;
-
-        let window_bounds = Bounds::new(
-            (res.height() / 2.) as i32,
-            -(res.height() / 2.) as i32,
-            -(res.width() / 2.) as i32,
-            (res.width() / 2.) as i32,
-        );
-        draw_bounds(&mut lines, &window_bounds);
 
         let wall_force = Vec3 {
             x: -0_f32.max(boid.translation.x - (res.width() / 2. - ui_state.wall_range))
@@ -293,35 +312,6 @@ fn go_align(
             println!("Warning");
             continue;
         }
-        /*
-        lines.line_colored(
-            boid.translation,
-            boid.translation + (final_target.normalize()) * 50.,
-            0.,
-            Color::ORANGE,
-        );
-
-        lines.line_colored(
-            boid.translation,
-            boid.translation + boid.rotation.mul_vec3(Vec3::X) * 50.,
-            0.,
-            Color::BLUE,
-        );
-
-        lines.line_colored(
-            boid.translation,
-            boid.translation + boid.rotation.mul_vec3(Vec3::Y) * 50.,
-            0.,
-            Color::GREEN,
-        );
-
-        lines.line_colored(
-            boid.translation,
-            boid.translation + wall_force,
-            0.,
-            Color::GREEN,
-        );
-         */
 
         let boid_forward = boid.rotation * Vec3::X;
         let boid_left = boid.rotation * Vec3::Y;
@@ -340,16 +330,15 @@ fn go_align(
     }
 }
 
-fn update_sight(
-    mut new_q: Query<(&mut Transform, &mut Sight, Entity)>,
-    mut lines: ResMut<DebugLines>,
+fn update_grid(
     windows: Query<&Window>,
-    ui_state: Res<UiState>,
+    sight_query: Query<(&mut Transform, &mut Sight, Entity)>,
+    mut grid_res: ResMut<GridRes>,
 ) {
     let res = &windows.single().resolution;
 
-    let mut p = GridPartion::new(
-        6,
+    let mut grid_partition = GridPartion::new(
+        8,
         Bounds::new(
             res.height() as i32 / 2,
             -res.height() as i32 / 2,
@@ -358,77 +347,93 @@ fn update_sight(
         ),
     );
 
-    for (a, _b, c) in new_q.iter() {
-        p.insert(c, a.translation)
+    for (transform, _b, entity) in sight_query.iter() {
+        grid_partition.insert(entity, transform.translation)
     }
-
-    let boxxed = GridNode::Grid(Box::from(p));
     
-    let s_map = new_q
-        .iter()
-        .map(|(boid, _s, e)| {
+    grid_res.grid = GridNode::Grid(Box::from(grid_partition));
+}
+
+fn spacial_ordering(grid: &GridNode) -> Vec<Entity> {
+    match grid {
+        GridNode::Grid(g) => vec![spacial_ordering(&g.top_left), spacial_ordering(&g.top_right),
+                                                    spacial_ordering(&g.bottom_left), spacial_ordering(&g.bottom_right)].concat(),
+        GridNode::Leaf(_, v) => return v.clone(),
+        GridNode::Empty(_, _) => return vec![],
+    }
+}
+
+fn update_sight(
+    mut sight_query: Query<(&mut Transform, &mut Sight, Entity)>,
+    ui_state: Res<UiState>,
+    grid_res: ResMut<GridRes>,
+) {
+    if let GridNode::Grid(gp) = &grid_res.grid {
+        let v = vec![&gp.top_left, &gp.top_right, &gp.bottom_left, &gp.bottom_right]
+            .par_iter()
+            .map(|a| spacial_ordering(a)
+            .into_iter()
+            .map(|e| sight_query.get(e).map(|(t, _, e)| (e, t))))
+            .flatten_iter()
+            .filter_map(|e| e.ok())
+            .collect::<Vec<_>>();
+    
+        //In limited tests this seems to improve performance.
+        //let v = spacial_ordering(&grid_res.grid).into_iter().map(|e| (e, sight_query.get(e).unwrap().0)).collect::<Vec<_>>();
+        
+        //let v: Vec<(Entity, &Transform)> = sight_query.into_iter().map(|(t, _s, e)| (e, t)).collect::<Vec<_>>();
+        let sight_map = v.into_par_iter().map(|(e, boid)|
+        {
             (
                 e,
                 query_grid(
-                    &boxxed,
+                    &grid_res.grid,
                     Bounds::new(
-                        (boid.translation.y + ui_state.bound_range / 2.) as i32,
-                        (boid.translation.y - ui_state.bound_range / 2.) as i32,
-                        (boid.translation.x - ui_state.bound_range / 2.) as i32,
-                        (boid.translation.x + ui_state.bound_range / 2.) as i32,
+                        (boid.translation.y + ui_state.bound_range*SCALE_FACTOR / 2.) as i32,
+                        (boid.translation.y - ui_state.bound_range*SCALE_FACTOR / 2.) as i32,
+                        (boid.translation.x - ui_state.bound_range*SCALE_FACTOR / 2.) as i32,
+                        (boid.translation.x + ui_state.bound_range*SCALE_FACTOR / 2.) as i32,
                     ),
-                    &mut lines,
                 ),
             )
-        })
-        .collect::<Vec<_>>();
-    /*
-    for (a, _, _) in new_q.iter() {
-        let _bounds = Bounds::new(
-            (a.translation.y + ui_state.bound_range / 2.) as i32,
-            (a.translation.y - ui_state.bound_range / 2.) as i32,
-            (a.translation.x - ui_state.bound_range / 2.) as i32,
-            (a.translation.x + ui_state.bound_range / 2.) as i32,
-        );
+        }).collect::<Rc<_>>();
 
-        //draw_bounds(&mut lines, &bounds);
-    }
-     */
-    /*
-    let debug_map = s_map.iter().map(|(e, v)| (new_q.get_component::<Transform>(*e).unwrap(), v.iter().map(|e| new_q.get_component::<Transform>(*e).unwrap()).collect::<Vec<_>>())).collect::<Vec<_>>();
+        for (e, v) in sight_map.into_iter() {
+            let updated_sight = v
+                .iter()
+                .map(|f| sight_query.get(*f).map(|e| e.0))
+                .filter(|e| e.is_ok())
+                .map(|e| *e.unwrap())
+                .collect::<Arc<_>>();
 
-    for (t, ts) in debug_map {
-        for target in ts {
-            lines.line_colored(t.translation, target.translation, 0., Color::RED)
+            let (_, mut s, _) = sight_query.get_mut(*e).unwrap();
+
+            s.0 = updated_sight;
         }
     }
-     */
+}
 
-    if ui_state.show_gp {draw_gp(&mut lines, &boxxed);}
 
-    for (e, v) in s_map {
-        let to_up = v
-            .iter()
-            .map(|f| *new_q.get(*f).unwrap().0)
-            .collect::<Vec<_>>();
-
-        let (_, mut s, _) = new_q.get_mut(e).unwrap();
-
-        s.0 = to_up;
+fn gp_draw_check(
+    mut lines: ResMut<DebugLines>,
+    ui_state: Res<UiState>,
+    grid_res: ResMut<GridRes>,
+    windows: Query<&Window>,
+) {
+    if ui_state.show_gp {
+        draw_gp(&mut lines, &grid_res.grid);
     }
-    /*
 
-    let bound_list = new_q.iter().map(|(boid, s, e)| (Bounds::new(
-        (boid.translation.y + BOUND_RANGE/2.) as i32,
-        (boid.translation.y - BOUND_RANGE/2.) as i32,
-        (boid.translation.x - BOUND_RANGE/2.) as i32,
-        (boid.translation.x - BOUND_RANGE/2.) as i32), s))
-        .collect::<Vec<_>>();
+    let res = &windows.single().resolution;
 
-    for (b, mut s) in bound_list {
-        s.0 = vec![];
-    }
-     */
+    let window_bounds = Bounds::new(
+        (res.height() / 2.) as i32,
+        -(res.height() / 2.) as i32,
+        -(res.width() / 2.) as i32,
+        (res.width() / 2.) as i32,
+    );
+
+    draw_bounds(&mut lines, &window_bounds);
 }
 
 fn draw_bounds(lines: &mut ResMut<DebugLines>, bounds: &Bounds) {
@@ -472,7 +477,7 @@ fn draw_gp(lines: &mut ResMut<DebugLines>, grid: &GridNode) {
     }
 }
 
-fn query_grid(grid_node: &GridNode, bounds: Bounds, lines: &mut ResMut<DebugLines>) -> Vec<Entity> {
+fn query_grid(grid_node: &GridNode, bounds: Bounds) -> Vec<Entity> {
     let _mid_b = Vec3::new(
         (bounds.z + bounds.w) as f32 / 2.,
         (bounds.x + bounds.y) as f32 / 2.,
@@ -481,33 +486,33 @@ fn query_grid(grid_node: &GridNode, bounds: Bounds, lines: &mut ResMut<DebugLine
 
     match grid_node {
         GridNode::Grid(g) => {
-            
-            if simple_aabb(bounds, g.bounds) {
-                let mut out_buf = vec![];
-                out_buf.append(&mut query_grid(&g.top_left, bounds, lines));
-                out_buf.append(&mut query_grid(&g.top_right, bounds, lines));
-                out_buf.append(&mut query_grid(&g.bottom_left, bounds, lines));
-                out_buf.append(&mut query_grid(&g.bottom_right, bounds, lines));
-                return out_buf;
+            if false {
+                if simple_aabb(bounds, g.bounds) {
+                    let mut out_buf = vec![];
+                    out_buf.append(&mut query_grid(&g.top_left, bounds));
+                    out_buf.append(&mut query_grid(&g.top_right, bounds));
+                    out_buf.append(&mut query_grid(&g.bottom_left, bounds));
+                    out_buf.append(&mut query_grid(&g.bottom_right, bounds));
+                    return out_buf;
+                } else {
+                    return vec![]
+                }
             } else {
-                return vec![]
-            }
-             
 
-            let test = less_simple_aabb(g.bounds, bounds);
-            if test == 1 {
-                let mut out_buf = vec![];
-                out_buf.append(&mut query_grid(&g.top_left, bounds, lines));
-                out_buf.append(&mut query_grid(&g.top_right, bounds, lines));
-                out_buf.append(&mut query_grid(&g.bottom_left, bounds, lines));
-                out_buf.append(&mut query_grid(&g.bottom_right, bounds, lines));
-                return out_buf;
-            } else if test == 2 {
-                return take_all(grid_node);
-            } else {
-                return vec![]
+                let test = less_simple_aabb(g.bounds, bounds);
+                if test == 1 {
+                    let mut out_buf = vec![];
+                    out_buf.append(&mut query_grid(&g.top_left, bounds));
+                    out_buf.append(&mut query_grid(&g.top_right, bounds));
+                    out_buf.append(&mut query_grid(&g.bottom_left, bounds));
+                    out_buf.append(&mut query_grid(&g.bottom_right, bounds));
+                    return out_buf;
+                } else if test == 2 {
+                    return take_all(grid_node);
+                } else {
+                    return vec![]
+                }
             }
-
 
 
             
@@ -535,7 +540,8 @@ fn less_simple_aabb(b1: Bounds, b2: Bounds) -> u8 {
     if !(b1.x < b2.y || b1.y > b2.x || b1.z > b2.w || b1.w < b2.z) {
         //If there is then classify
         //We will assume that both bbs are the correct way up (top is up)
-        if b1.x <= b2.x && b1.y >= b2.x && b1.y >= b2.y && b1.w <= b2.w {2}
+        //Is b2 IN b1?
+        if b1.x <= b2.x && b1.z >= b2.z && b1.y >= b2.y && b1.w <= b2.w {2}
         else {1}
     }
     else {0}
@@ -588,10 +594,16 @@ pub struct Wobble;
 pub struct Align;
 
 #[derive(Component)]
-pub struct Sight(Vec<Transform>);
+pub struct Sight(Arc<[Transform]>);
 
 #[derive(Component)]
 pub struct Boid;
+
+#[derive(Resource, Default)]
+struct GridRes {
+    grid: GridNode,
+}
+
 
 enum GridNode {
     Grid(Box<GridPartion>),
@@ -599,6 +611,11 @@ enum GridNode {
     Empty(Bounds, u8),
 }
 
+impl Default for GridNode {
+    fn default() -> Self {
+        GridNode::Empty(IVec4::default(), 0)
+    }
+}
 struct GridPartion {
     bounds: Bounds,
 
